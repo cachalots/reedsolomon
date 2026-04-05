@@ -27,8 +27,10 @@ func newMatrix(rows, cols int) (matrix, error) {
 	}
 
 	m := matrix(make([][]byte, rows))
+	backing := make([]byte, rows*cols)
 	for i := range m {
-		m[i] = make([]byte, cols)
+		start := i * cols
+		m[i] = backing[start : start+cols]
 	}
 	return m, nil
 }

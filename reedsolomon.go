@@ -186,9 +186,18 @@ type reedSolomon struct {
 	o            options
 	mPoolSz      int
 	mPool        sync.Pool // Pool for temp matrices, etc
+	rPool        sync.Pool // Pool for reconstruct scratch slices
 }
 
 var _ = Extensions(&reedSolomon{})
+
+type reconstructScratch struct {
+	subShards    [][]byte
+	validIndices []int
+	invalidSlice []int
+	outputs      [][]byte
+	matrixRows   [][]byte
+}
 
 func (r *reedSolomon) ShardSizeMultiple() int {
 	return 1
@@ -594,6 +603,15 @@ func New(dataShards, parityShards int, opts ...Option) (Encoder, error) {
 		}
 		r.mPoolSz = sz
 	}
+	r.rPool.New = func() any {
+		return &reconstructScratch{
+			subShards:    make([][]byte, r.dataShards),
+			validIndices: make([]int, r.dataShards),
+			invalidSlice: make([]int, 0, r.totalShards),
+			outputs:      make([][]byte, r.totalShards),
+			matrixRows:   make([][]byte, r.totalShards),
+		}
+	}
 	return &r, err
 }
 
@@ -610,6 +628,18 @@ func (r *reedSolomon) putTmpSlice(b []byte) {
 		// Sanity check
 		panic(fmt.Sprintf("got short tmp returned, want %d, got %d", r.mPoolSz, cap(b)))
 	}
+}
+
+func (r *reedSolomon) getReconstructScratch() *reconstructScratch {
+	return r.rPool.Get().(*reconstructScratch)
+}
+
+func (r *reedSolomon) putReconstructScratch(s *reconstructScratch) {
+	clear(s.subShards)
+	clear(s.outputs)
+	clear(s.matrixRows)
+	s.invalidSlice = s.invalidSlice[:0]
+	r.rPool.Put(s)
 }
 
 // multiplyRowWithMatrix multiplies a single row with a matrix to produce a new row.
@@ -1712,9 +1742,12 @@ func (r *reedSolomon) reconstruct(shards [][]byte, dataOnly bool, required []boo
 	//
 	// Also, create an array of indices of the valid rows we do have
 	// and the invalid rows we don't have up until we have enough valid rows.
-	subShards := make([][]byte, r.dataShards)
-	validIndices := make([]int, r.dataShards)
-	invalidIndices := make([]int, 0)
+	scratch := r.getReconstructScratch()
+	defer r.putReconstructScratch(scratch)
+
+	subShards := scratch.subShards[:r.dataShards]
+	validIndices := scratch.validIndices[:r.dataShards]
+	invalidIndices := scratch.invalidSlice[:0]
 	subMatrixRow := 0
 	for matrixRow := 0; matrixRow < r.totalShards && subMatrixRow < r.dataShards; matrixRow++ {
 		if len(shards[matrixRow]) != 0 {
@@ -1734,9 +1767,8 @@ func (r *reedSolomon) reconstruct(shards [][]byte, dataOnly bool, required []boo
 
 	// Unified reconstruction: build a single decode matrix for all missing shards
 	// and reconstruct them in one codeSomeShards call.
-	outputCount := 0
-	outputs := make([][]byte, r.totalShards)
-	matrixRows := make([][]byte, r.totalShards)
+	outputs := scratch.outputs[:0]
+	matrixRows := scratch.matrixRows[:0]
 
 	// Count and prepare missing data shards
 	for iShard := 0; iShard < r.dataShards; iShard++ {
@@ -1746,9 +1778,8 @@ func (r *reedSolomon) reconstruct(shards [][]byte, dataOnly bool, required []boo
 			} else {
 				shards[iShard] = AllocAligned(1, shardSize)[0]
 			}
-			outputs[outputCount] = shards[iShard]
-			matrixRows[outputCount] = dataDecodeMatrix[iShard]
-			outputCount++
+			outputs = append(outputs, shards[iShard])
+			matrixRows = append(matrixRows, dataDecodeMatrix[iShard])
 		}
 	}
 
@@ -1761,18 +1792,17 @@ func (r *reedSolomon) reconstruct(shards [][]byte, dataOnly bool, required []boo
 				} else {
 					shards[iShard] = AllocAligned(1, shardSize)[0]
 				}
-				outputs[outputCount] = shards[iShard]
+				outputs = append(outputs, shards[iShard])
 				// For parity shards, multiply parity row with inverted matrix
 				parityIdx := iShard - r.dataShards
-				matrixRows[outputCount] = multiplyRowWithMatrix(r.parity[parityIdx], dataDecodeMatrix)
-				outputCount++
+				matrixRows = append(matrixRows, multiplyRowWithMatrix(r.parity[parityIdx], dataDecodeMatrix))
 			}
 		}
 	}
 
 	// Single reconstruction call for all missing shards
-	if outputCount > 0 {
-		r.codeSomeShards(matrixRows[:outputCount], subShards, outputs[:outputCount], shardSize, true)
+	if len(outputs) > 0 {
+		r.codeSomeShards(matrixRows, subShards, outputs, shardSize, true)
 	}
 	return nil
 }
