@@ -436,6 +436,9 @@ func New(dataShards, parityShards int, opts ...Option) (Encoder, error) {
 	for _, opt := range opts {
 		opt(&o)
 	}
+	if o.workAlloc == nil {
+		o.workAlloc = &defaultWorkAllocator{}
+	}
 
 	totShards := dataShards + parityShards
 	switch {
